@@ -1,0 +1,28 @@
+#это генерировал через ии(чтобы улучшить читаемость)
+repos:
+  # Форматирование и линтинг Python + Jupyter
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.4
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+        types_or: [python, pyi, jupyter]
+
+      - id: ruff-format
+        types_or: [python, pyi, jupyter]
+
+  # Базовые проверки файлов
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.ipynb$
+
+      - id: end-of-file-fixer
+        exclude: \.ipynb$
+
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=2048]
