@@ -1,11 +1,14 @@
+from functools import partial
+
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 import torch
-from data import FLOAT_KEYS, build_sequences, collate
+from data import FLOAT_KEYS, ClientDataset, build_sequences, collate
 from run import move_transactions
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
@@ -124,8 +127,10 @@ def run_ig_segment(
     return dict_cnt
 
 
-def ig_path(model, df_base, df_pred, key, batch_args, client_id, IG_PRECISION=50, output=False):
-
+def ig_path(
+    model, df_base, df_pred, key, batch_args, client_id, IG_PRECISION=50, output=False, seed=42
+):
+    torch.manual_seed(seed)
     if key not in FLOAT_KEYS:
         raise RuntimeError("IG работает только на непрерывных данных.")
 
@@ -229,3 +234,267 @@ for batch in dataloader:
 
 
 """
+
+
+@torch.inference_mode()
+def score_model(model, client, batch_args, faster=False):
+    model.eval()
+    model.zero_grad()
+    if faster:
+        cur = build_sequences(client.to_pandas(), batch_args["metadata"], batch_args["keys"])
+        dataloader = DataLoader(
+            ClientDataset(cur, client["client_id"].unique().cast(pl.String).to_list()),
+            batch_size=batch_args["batch_size"],
+            shuffle=batch_args["shuffle"],
+            generator=torch.Generator().manual_seed(batch_args["seed"]),
+            num_workers=0,
+            collate_fn=partial(collate, keys=batch_args["keys"]),
+        )
+        frames = []
+        for batch in dataloader:
+            logits = model.classifier(model.encode(move_transactions(batch, batch_args["device"])))
+            probab = logits.softmax(dim=-1).cpu().numpy()
+            frames.append(
+                pl.DataFrame(
+                    {
+                        "client_id": batch["client_id"],
+                        "target": batch["target"].numpy(),
+                        "logit_0": logits[:, 0].cpu().numpy(),
+                        "logit_1": logits[:, 1].cpu().numpy(),
+                        "probab_0": probab[:, 0],
+                        "probab_1": probab[:, 1],
+                        "n_transactions": batch["lengths"].numpy(),
+                    }
+                )
+            )
+
+        frame = pl.concat(frames, how="vertical")
+        return frame
+    else:
+        cur = build_sequences(client.to_pandas(), batch_args["metadata"], batch_args["keys"])
+        batch = collate(list(cur.values()), batch_args["keys"])
+        embed = model.encode(move_transactions(batch, batch_args["device"]))
+        logits = model.classifier(embed)
+        probab = torch.softmax(logits, dim=-1)
+        return probab[:, 1]
+
+
+def make_fake_clients(df, attr_order, key, start_id):
+    result = []
+    current = df.clone()
+
+    result.append(current.with_columns(pl.lit(start_id).alias("client_id")))
+
+    for step, idx in enumerate(attr_order, start=1):
+        current[int(idx), key] = 0
+
+        result.append(current.with_columns(pl.lit(start_id + step).alias("client_id")))
+
+    return pl.concat(result, how="vertical")
+
+
+def MaskingClientFaster(
+    attr, model, df, key, batch_args, device, top_k=None, descending=False, random=False, seed=42
+):
+    "Предполагается что attr является одномерным тензором."
+    if len(attr.shape) != 1:
+        raise RuntimeError("Masking работает только с одномерными тензорами.")
+
+    torch.manual_seed(seed)
+
+    index = None
+    if random:
+        index = torch.randperm(len(df[key])).numpy().tolist()
+    else:
+        index = (
+            torch.argsort(attr.abs(), stable=True, descending=descending)[:top_k]
+            .detach()
+            .cpu()
+            .numpy()
+            .tolist()
+        )
+
+    df_fake_clients = make_fake_clients(df, index, key, int(df["client_id"][0]))
+    value = np.zeros(attr.shape[0] + 1)
+    result = score_model(model, df_fake_clients, batch_args, faster=True)
+    for x in range(attr.shape[0] + 1):
+        value[x] = result.filter(pl.col("client_id").eq(str(x + int(df["client_id"][0]))))[
+            "probab_1"
+        ].to_list()[0]
+    return value
+
+
+def MaskingClient(attr, model, df, key, batch_args, device, top_k=None, descending=False):
+    "Предполагается что attr является одномерным тензором."
+    if len(attr.shape) != 1:
+        raise RuntimeError("Masking работает только с одномерными тензорами.")
+
+    df_copy = df.clone()
+    index = (
+        torch.argsort(attr.abs(), stable=True, descending=descending)[:top_k]
+        .detach()
+        .cpu()
+        .numpy()
+        .tolist()
+    )
+    value = torch.zeros(attr.shape[0] + 1, device=device)
+    value[0] = score_model(model, df_copy, batch_args)
+    for idx, id in enumerate(index):
+        df_copy[id, key] = 0
+        result = score_model(model, df_copy, batch_args)
+        value[idx + 1] = result
+    return value.detach().cpu()
+
+
+def RandomMaskingClient(model, df, key, batch_args, device, top_k=None, seed=42):
+    "Предполагается что attr является одномерным тензором."
+    torch.manual_seed(seed)
+
+    df_copy = df.clone()
+    index = torch.randperm(len(df[key])).numpy().tolist()
+    value = torch.zeros(len(df[key]) + 1, device=device)
+    value[0] = score_model(model, df_copy, batch_args)
+    for idx, id in enumerate(index):
+        df_copy[id, key] = 0
+        result = score_model(model, df_copy, batch_args)
+        value[idx + 1] = result
+    return value.detach().cpu()
+
+
+def RandomFeaturePermutation(model, df, key, batch_args, device, seed=42):
+    torch.manual_seed(seed)
+
+    index = torch.randperm(len(df[key])).numpy().tolist()
+    df_copy = df.clone()
+    df_copy = df_copy.with_columns(pl.Series(key, df_copy[key].to_torch()[index]))
+    return score_model(model, df_copy, batch_args)
+
+
+def make_fake_clients_ig(df, series_tuple, key):
+    result = []
+    current = df.clone()
+
+    for series, name in series_tuple:
+        result.append(current.with_columns(pl.lit(name).alias("client_id"), series.alias(key)))
+
+    return pl.concat(result, how="vertical")
+
+
+def create_client_series_ig(df_client, window_size, key, IG_PRECISION, client):
+
+    path = torch.linspace(0, 1, IG_PRECISION)
+    result = []
+    name = f"{client} {window_size}"
+
+    reps = range(len(df_client[key]) - window_size + 1)
+    for rep in reps:
+        df_window, df_nwindow = get_windows(df_client, rep, window_size, key)
+        values_window = df_window[key].to_torch()
+        values_nwindow = df_nwindow[key].to_torch()
+
+        for idx, x in enumerate(path):
+            value = values_nwindow + values_window * x
+            result += [(pl.Series(key, value), f"{name} {rep} {idx}")]
+    return result
+
+
+def run_ig_faster(
+    model,
+    dfs,
+    key,
+    window_size: None | float,
+    batch_args,
+    IG_PRECISION=50,
+):
+
+    if isinstance(window_size, int) and np.abs(window_size) > 1:
+        raise RuntimeError(
+            "Размер окна задается в процентном соотношении, численно размер указывать нельзя!"
+        )
+
+    torch.manual_seed(batch_args["seed"])
+    cur_window_size = None
+    values = {}
+    fake_clients = pl.DataFrame()
+    for df_client in tqdm(dfs, desc="Collecting all-set"):
+        if window_size is None:
+            cur_window_size = len(df_client[key])
+        else:
+            cur_window_size = int(len(df_client[key]) * window_size)
+
+        fake_clients = pl.concat(
+            [
+                fake_clients,
+                make_fake_clients_ig(
+                    df_client,
+                    create_client_series_ig(
+                        df_client, cur_window_size, key, IG_PRECISION, df_client["client_id"][0]
+                    ),
+                    key,
+                ),
+            ],
+            how="vertical",
+        )
+        values[df_client["client_id"][0]] = df_client[key].to_torch()
+
+    dataset = build_sequences(
+        fake_clients.to_pandas(), batch_args["metadata"], batch_args["keys"], require_grad=True
+    )
+
+    dataloader = DataLoader(
+        ClientDataset(dataset, fake_clients["client_id"].unique().cast(pl.String).to_list()),
+        batch_size=batch_args["batch_size"],
+        shuffle=batch_args["shuffle"],
+        generator=torch.Generator().manual_seed(batch_args["seed"]),
+        num_workers=0,
+        collate_fn=partial(collate, keys=batch_args["keys"]),
+    )
+
+    all_attributions = {}
+    for batch in tqdm(dataloader, desc="Batching throw dataloader"):
+        embed = model.encode(move_transactions(batch, batch_args["device"]))
+        logits = model.classifier(embed)
+        probab = torch.softmax(logits, dim=-1)
+
+        # client_id, window_size_cur, id_window, ig_id = int(batch['client_id'][0].split())
+        # print(batch['client_id'])
+        # print(dataset)
+        # print(dataset[batch['client_id']][key])
+        # break
+
+        input_list = [dataset[x][key] for x in batch["client_id"]]
+        grad = torch.autograd.grad(inputs=input_list, outputs=probab[:, 1].sum(), allow_unused=True)
+        for idx, client in enumerate(batch["client_id"]):
+            client_cur, window_size_cur, id_window, ig_id = client.split()
+            window_size_cur, ig_id, id_window = int(window_size_cur), int(ig_id), int(id_window)
+            if client_cur not in all_attributions:
+                all_attributions[f"{client_cur}"] = torch.zeros(
+                    (
+                        values[client_cur].shape[0] - window_size_cur + 1,
+                        IG_PRECISION,
+                        values[client_cur].shape[0],
+                    )
+                )
+
+            all_attributions[f"{client_cur}"][id_window, ig_id, :] = grad[idx]
+
+    # print(all_attributions['10345'].shape)
+    for client in all_attributions:
+        grads = torch.as_tensor(all_attributions[client])
+
+        avg_grads = (grads[:, :-1, :] + grads[:, 1:, :]) / 2
+
+        integrated = avg_grads.mean(dim=1)
+
+        n = values[client].numel()
+        w = n if window_size is None else int(window_size * n)
+
+        delta = torch.zeros_like(integrated)
+
+        original = values[client].to(dtype=integrated.dtype, device=integrated.device)
+
+        for start in range(integrated.shape[0]):
+            delta[start, start : start + w] = original[start : start + w]
+
+        all_attributions[client] = integrated * delta
+    return all_attributions
