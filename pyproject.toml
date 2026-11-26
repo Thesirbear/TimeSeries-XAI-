@@ -7,6 +7,8 @@ extend-exclude = [
     "papers_gits"
 ]
 
+exclude = ["*.ipynb"]
+
 force-exclude = true
 
 
